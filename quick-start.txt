@@ -1,0 +1,19 @@
+# Unzip and enter directory
+unzip sre-bot-demo.zip
+cd sre-bot-demo
+
+# Install dependencies
+npm install -g @anthropic-ai/claude-code
+pip install -r requirements.txt
+
+# Configure .env with your keys:
+#   ANTHROPIC_API_KEY=your-anthropic-key
+#   SLACK_BOT_TOKEN=xoxb-your-bot-token
+#   SLACK_APP_TOKEN=xapp-your-app-token
+
+# Start infrastructure (3 terminals)
+python scripts/metric_logging.py                  # Terminal 1
+docker-compose -f config/docker-compose.yml up    # Terminal 2
+python sre_bot_slack.py                           # Terminal 3
+
+# Wait 60 seconds for metrics, then @mention the bot in Slack

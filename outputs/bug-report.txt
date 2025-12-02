@@ -1,0 +1,37 @@
+Issue Summary: claude-agent-sdk 0.1.10 - SDK MCP Servers Fail with 
+  ProcessTransport is not ready for writing
+
+  Environment:
+  - claude-agent-sdk: 0.1.10
+  - Claude Code CLI: 2.0.57-dev (also tested with bundled 2.0.53)
+  - Python: 3.13.9 (also tested with 3.14)
+  - macOS arm64
+
+  Problem:
+  When using in-process SDK MCP servers (created via create_sdk_mcp_server()),
+  the SDK fails with:
+  CLIConnectionError: ProcessTransport is not ready for writing
+
+  Root Cause:
+  The CLI sends control_request messages for MCP initialization (mcp_message with
+   method: initialize) before the SDK's transport is ready to respond. The
+  _handle_control_request() method in query.py:310 tries to write a response, but
+   _stdin_stream is either None or _ready is False.
+
+  Additional Note:
+  The bundled CLI (2.0.53) also rejects {"type": "sdk"} MCP configs with "Does
+  not adhere to MCP server configuration schema" - only CLI 2.0.57+ accepts them.
+
+  Reproduction:
+  from claude_agent_sdk import query, ClaudeAgentOptions, create_sdk_mcp_server,
+  tool
+
+  @tool(name="test", description="test", input_schema={})
+  async def test_tool(args):
+      return {"content": [{"type": "text", "text": "ok"}]}
+
+  server = create_sdk_mcp_server(name="test", tools=[test_tool])
+  options = ClaudeAgentOptions(mcp_servers={"test": server})
+
+  async for msg in query(prompt="hello", options=options):
+      print(msg)  # Crashes immediately

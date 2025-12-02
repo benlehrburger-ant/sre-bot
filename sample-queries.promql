@@ -1,0 +1,14 @@
+# Sample PromQL Queries for SRE Bot Demo
+# Use these in the Prometheus UI at http://localhost:9090
+
+# Error rate by service (errors per second)
+rate(http_requests_total{status="500"}[1m])
+
+# DB connection utilization
+db_connections_active
+
+# P99 latency
+http_request_duration_milliseconds{quantile="0.99"}
+
+# All HTTP requests
+http_requests_total
