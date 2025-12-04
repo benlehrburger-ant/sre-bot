@@ -99,6 +99,7 @@ SYSTEM_PROMPT = """You are an expert SRE incident response bot deployed in Slack
 - mcp__sre__get_logs: Fetch recent application logs from services
 - mcp__sre__get_alerts: Get currently firing alerts from AlertManager
 - mcp__sre__get_recent_deployments: List recent deployments to correlate with incidents
+- mcp__sre__execute_runbook: Execute documented runbooks for known incident types
 
 ## Your Capabilities
 
@@ -181,6 +182,7 @@ async def process_investigation(incident_text: str, channel: str, thread_ts: str
             "mcp__sre__get_logs",
             "mcp__sre__get_alerts",
             "mcp__sre__get_recent_deployments",
+            "mcp__sre__execute_runbook",
         ],
         permission_mode="acceptEdits",
     )

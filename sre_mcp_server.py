@@ -145,6 +145,41 @@ Useful for correlating incidents with recent changes.""",
             },
             "required": []
         }
+    },
+    {
+        "name": "execute_runbook",
+        "description": """Execute a documented runbook for a known issue type.
+
+Runbooks provide structured investigation and remediation procedures for common incidents.
+Use this when you've identified a specific type of issue and want to follow the standard
+operating procedure.
+
+Available runbooks:
+- database_connection_exhaustion: For DB pool exhaustion, "too many connections" errors
+- high_latency_cascade: For P99 latency spikes cascading across services
+- elevated_error_rates: For 5xx error rate increases
+
+Each runbook has two phases:
+- investigate: Returns diagnostic steps and queries to run
+- remediate: Returns remediation actions (requires investigation first)
+
+Always run the investigate phase first to confirm the issue before remediation.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "runbook": {
+                    "type": "string",
+                    "enum": ["database_connection_exhaustion", "high_latency_cascade", "elevated_error_rates"],
+                    "description": "Which runbook to execute"
+                },
+                "phase": {
+                    "type": "string",
+                    "enum": ["investigate", "remediate"],
+                    "description": "Phase to execute: 'investigate' for diagnosis, 'remediate' for fixes"
+                }
+            },
+            "required": ["runbook", "phase"]
+        }
     }
 ]
 
@@ -718,6 +753,376 @@ async def get_recent_deployments(service: str = None) -> dict[str, Any]:
     }
 
 
+# Runbook definitions based on CLAUDE.md
+RUNBOOKS = {
+    "database_connection_exhaustion": {
+        "name": "Database Connection Exhaustion",
+        "symptoms": [
+            "api-server in CrashLoopBackOff or high error rate",
+            "\"Connection refused\" or \"too many connections\" in logs",
+            "db_connections_active near max (100)",
+        ],
+        "investigate": {
+            "description": "Diagnose database connection pool exhaustion",
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "Check current DB connection utilization",
+                    "query": "db_connections_active",
+                    "threshold": "> 90 indicates critical exhaustion",
+                },
+                {
+                    "step": 2,
+                    "action": "Check if connections are queuing",
+                    "query": "db_connections_waiting",
+                    "threshold": "> 0 indicates connection starvation",
+                },
+                {
+                    "step": 3,
+                    "action": "Identify which service is holding connections",
+                    "query": "sum(rate(http_requests_total[1m])) by (service)",
+                    "note": "High request rate + high connections = likely culprit",
+                },
+                {
+                    "step": 4,
+                    "action": "Check for connection leak indicators in logs",
+                    "tool": "get_logs",
+                    "params": {"service": "postgres", "level": "error"},
+                },
+                {
+                    "step": 5,
+                    "action": "Check recent deployments for config changes",
+                    "tool": "get_recent_deployments",
+                    "note": "Look for connection pool or timeout changes",
+                },
+            ],
+        },
+        "remediate": {
+            "description": "Remediation steps for DB connection exhaustion",
+            "immediate_actions": [
+                {
+                    "priority": 1,
+                    "action": "Restart affected service pods",
+                    "command": "kubectl rollout restart deployment/api-server -n production",
+                    "effect": "Releases held connections, temporary fix",
+                    "risk": "Brief service interruption during restart",
+                },
+                {
+                    "priority": 2,
+                    "action": "Scale down affected service to release connections",
+                    "command": "kubectl scale deployment/api-server --replicas=1 -n production",
+                    "effect": "Reduces connection pressure immediately",
+                    "risk": "Reduced capacity during incident",
+                },
+            ],
+            "long_term_fixes": [
+                {
+                    "action": "Review and fix connection pool configuration",
+                    "details": "Check pool size, idle timeout, max lifetime settings",
+                },
+                {
+                    "action": "Add connection pool metrics and alerts",
+                    "details": "Alert at 70% utilization before hitting limits",
+                },
+                {
+                    "action": "Implement connection retry with backoff",
+                    "details": "Prevents thundering herd on recovery",
+                },
+            ],
+            "escalation": {
+                "team": "Database team",
+                "channel": "#dba-oncall",
+                "when": "If connections don't recover after restart, or if this recurs",
+            },
+        },
+    },
+    "high_latency_cascade": {
+        "name": "High Latency Cascade",
+        "symptoms": [
+            "P99 latency > 1000ms on api-server",
+            "Downstream services (payment-svc) also slow",
+            "Error rate increasing as timeouts occur",
+        ],
+        "investigate": {
+            "description": "Diagnose latency cascade across services",
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "Check P99 latency across all services",
+                    "query": "http_request_duration_milliseconds{quantile=\"0.99\"}",
+                    "threshold": "> 500ms warning, > 2000ms critical",
+                },
+                {
+                    "step": 2,
+                    "action": "Identify where latency originates",
+                    "query": "topk(5, http_request_duration_milliseconds{quantile=\"0.99\"})",
+                    "note": "Service with highest latency is likely the source",
+                },
+                {
+                    "step": 3,
+                    "action": "Check database query times",
+                    "query": "db_connections_waiting",
+                    "note": "Waiting connections indicate DB bottleneck",
+                },
+                {
+                    "step": 4,
+                    "action": "Check for resource constraints",
+                    "queries": [
+                        "container_cpu_usage_ratio",
+                        "container_memory_usage_ratio",
+                    ],
+                    "threshold": "CPU > 80% or Memory > 90% indicates resource pressure",
+                },
+                {
+                    "step": 5,
+                    "action": "Review error logs for timeout patterns",
+                    "tool": "get_logs",
+                    "params": {"service": "api-server", "level": "error"},
+                },
+            ],
+        },
+        "remediate": {
+            "description": "Remediation steps for latency cascade",
+            "immediate_actions": [
+                {
+                    "priority": 1,
+                    "action": "If DB-related: Check for long-running queries",
+                    "command": "SELECT * FROM pg_stat_activity WHERE state = 'active' AND query_start < now() - interval '30 seconds'",
+                    "effect": "Identifies blocking queries",
+                },
+                {
+                    "priority": 2,
+                    "action": "If CPU-bound: Scale horizontally",
+                    "command": "kubectl scale deployment/api-server --replicas=5 -n production",
+                    "effect": "Distributes load across more pods",
+                },
+                {
+                    "priority": 3,
+                    "action": "If memory-bound: Restart to clear potential leaks",
+                    "command": "kubectl rollout restart deployment/api-server -n production",
+                    "effect": "Clears memory, resets connections",
+                },
+            ],
+            "long_term_fixes": [
+                {
+                    "action": "Add circuit breakers between services",
+                    "details": "Prevents cascade by failing fast",
+                },
+                {
+                    "action": "Implement request timeouts at each layer",
+                    "details": "Ensures requests don't hang indefinitely",
+                },
+                {
+                    "action": "Add caching for frequently accessed data",
+                    "details": "Reduces load on downstream services",
+                },
+            ],
+            "escalation": {
+                "team": "Platform team",
+                "channel": "#platform-oncall",
+                "when": "If latency doesn't improve after scaling, or if root cause unclear",
+            },
+        },
+    },
+    "elevated_error_rates": {
+        "name": "Elevated Error Rates",
+        "symptoms": [
+            "http_requests_total{status=\"500\"} increasing",
+            "Alerts from monitoring",
+            "User complaints",
+        ],
+        "investigate": {
+            "description": "Diagnose elevated 5xx error rates",
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "Identify which service has errors",
+                    "query": "sum(rate(http_requests_total{status=\"500\"}[1m])) by (service)",
+                    "threshold": "> 1% warning, > 5% critical",
+                },
+                {
+                    "step": 2,
+                    "action": "Calculate error ratio percentage",
+                    "query": "sum(rate(http_requests_total{status=\"500\"}[1m])) by (service) / sum(rate(http_requests_total[1m])) by (service)",
+                    "note": "Shows error percentage per service",
+                },
+                {
+                    "step": 3,
+                    "action": "Check if correlated with latency",
+                    "query": "http_request_duration_milliseconds{quantile=\"0.99\"}",
+                    "note": "High latency + errors often indicates timeouts",
+                },
+                {
+                    "step": 4,
+                    "action": "Check for resource exhaustion",
+                    "queries": [
+                        "db_connections_active",
+                        "container_cpu_usage_ratio",
+                        "container_memory_usage_ratio",
+                    ],
+                },
+                {
+                    "step": 5,
+                    "action": "Check logs for specific error messages",
+                    "tool": "get_logs",
+                    "params": {"service": "api-server", "level": "error"},
+                },
+                {
+                    "step": 6,
+                    "action": "Check for recent deployments",
+                    "tool": "get_recent_deployments",
+                    "note": "Recent changes are often the cause",
+                },
+            ],
+        },
+        "remediate": {
+            "description": "Remediation depends on root cause identified above",
+            "decision_tree": [
+                {
+                    "condition": "If caused by DB connection exhaustion",
+                    "action": "Follow database_connection_exhaustion runbook",
+                },
+                {
+                    "condition": "If caused by high latency/timeouts",
+                    "action": "Follow high_latency_cascade runbook",
+                },
+                {
+                    "condition": "If caused by recent deployment",
+                    "action": "Rollback the deployment",
+                    "command": "kubectl rollout undo deployment/api-server -n production",
+                },
+                {
+                    "condition": "If caused by external dependency failure",
+                    "action": "Enable circuit breaker / fallback mode",
+                },
+            ],
+            "immediate_actions": [
+                {
+                    "priority": 1,
+                    "action": "If recent deployment suspected, rollback immediately",
+                    "command": "kubectl rollout undo deployment/<service> -n production",
+                    "effect": "Reverts to last known good state",
+                },
+            ],
+            "escalation": {
+                "team": "Depends on affected service",
+                "channels": {
+                    "api-server": "#platform-oncall",
+                    "payment-svc": "#payments-oncall",
+                    "auth-svc": "#identity-oncall",
+                },
+                "when": "If root cause cannot be identified or errors persist after remediation",
+            },
+        },
+    },
+}
+
+
+async def execute_runbook(runbook: str, phase: str) -> dict[str, Any]:
+    """Execute a documented runbook for incident response."""
+    if runbook not in RUNBOOKS:
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Unknown runbook: {runbook}\nAvailable runbooks: {', '.join(RUNBOOKS.keys())}"
+            }],
+            "isError": True
+        }
+
+    rb = RUNBOOKS[runbook]
+    lines = [f"=== Runbook: {rb['name']} ===", ""]
+
+    if phase == "investigate":
+        # Show symptoms to confirm this is the right runbook
+        lines.append("SYMPTOMS (confirm these match your incident):")
+        for symptom in rb["symptoms"]:
+            lines.append(f"  • {symptom}")
+        lines.append("")
+
+        # Show investigation steps
+        inv = rb["investigate"]
+        lines.append(f"INVESTIGATION: {inv['description']}")
+        lines.append("")
+
+        for step in inv["steps"]:
+            lines.append(f"Step {step['step']}: {step['action']}")
+
+            if "query" in step:
+                lines.append(f"  → Run query: {step['query']}")
+            if "queries" in step:
+                for q in step["queries"]:
+                    lines.append(f"  → Run query: {q}")
+            if "tool" in step:
+                lines.append(f"  → Use tool: {step['tool']}")
+                if "params" in step:
+                    params_str = ", ".join(f"{k}={v}" for k, v in step["params"].items())
+                    lines.append(f"     with params: {params_str}")
+            if "threshold" in step:
+                lines.append(f"  → Threshold: {step['threshold']}")
+            if "note" in step:
+                lines.append(f"  → Note: {step['note']}")
+            lines.append("")
+
+        lines.append("After completing investigation, run this runbook again with phase='remediate'")
+
+    elif phase == "remediate":
+        rem = rb["remediate"]
+        lines.append(f"REMEDIATION: {rem['description']}")
+        lines.append("")
+
+        # Show decision tree if present
+        if "decision_tree" in rem:
+            lines.append("DECISION TREE:")
+            for decision in rem["decision_tree"]:
+                lines.append(f"  IF: {decision['condition']}")
+                lines.append(f"  THEN: {decision['action']}")
+                if "command" in decision:
+                    lines.append(f"       Command: {decision['command']}")
+                lines.append("")
+
+        # Show immediate actions
+        if "immediate_actions" in rem:
+            lines.append("IMMEDIATE ACTIONS:")
+            for action in rem["immediate_actions"]:
+                lines.append(f"  [{action['priority']}] {action['action']}")
+                if "command" in action:
+                    lines.append(f"      Command: {action['command']}")
+                if "effect" in action:
+                    lines.append(f"      Effect: {action['effect']}")
+                if "risk" in action:
+                    lines.append(f"      Risk: {action['risk']}")
+                lines.append("")
+
+        # Show long-term fixes
+        if "long_term_fixes" in rem:
+            lines.append("LONG-TERM FIXES (for post-incident):")
+            for fix in rem["long_term_fixes"]:
+                lines.append(f"  • {fix['action']}")
+                lines.append(f"    {fix['details']}")
+            lines.append("")
+
+        # Show escalation info
+        if "escalation" in rem:
+            esc = rem["escalation"]
+            lines.append("ESCALATION:")
+            if "team" in esc:
+                lines.append(f"  Team: {esc['team']}")
+            if "channel" in esc:
+                lines.append(f"  Channel: {esc['channel']}")
+            if "channels" in esc:
+                for svc, channel in esc["channels"].items():
+                    lines.append(f"  {svc}: {channel}")
+            if "when" in esc:
+                lines.append(f"  When: {esc['when']}")
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": "\n".join(lines)
+        }]
+    }
+
+
 async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Route tool calls to the appropriate handler."""
     if name == "query_metrics":
@@ -737,6 +1142,11 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
     elif name == "get_recent_deployments":
         return await get_recent_deployments(
             service=arguments.get("service")
+        )
+    elif name == "execute_runbook":
+        return await execute_runbook(
+            runbook=arguments.get("runbook", ""),
+            phase=arguments.get("phase", "investigate")
         )
     else:
         return {
