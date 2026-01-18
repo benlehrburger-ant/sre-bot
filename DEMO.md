@@ -141,7 +141,7 @@ DB_POOL_SIZE=1
 ### Step 2: Redeploy the Container
 
 ```bash
-docker-compose -f config/docker-compose.yml up --build api-server
+docker-compose -f config/docker-compose.yml up
 ```
 
 This simulates a bad configuration change that causes connection exhaustion.
