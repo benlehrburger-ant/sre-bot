@@ -348,3 +348,4 @@ curl -X POST http://localhost:3000/webhooks/pagerduty \
 | Slack message not posting | Verify channel name/ID, check bot is in channel |
 | Confluence 401 error | Regenerate API token, verify email matches |
 | PagerDuty 401 error | Check API key is valid, verify From email |
+| Bot slow or inconsistent responses | Docker may be the issue. Check if Docker is running: `docker ps`. Make sure you use OrbStack instead of Docker Desktop for better performance. |

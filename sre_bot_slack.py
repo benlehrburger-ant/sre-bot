@@ -468,6 +468,13 @@ async def handle_mention(event, say, client):
 
     channel = event["channel"]
     thread_ts = event.get("thread_ts", event["ts"])
+    message_ts = event["ts"]
+
+    # React to the message to acknowledge we're working on it
+    try:
+        await client.reactions_add(channel=channel, timestamp=message_ts, name="on-it")
+    except Exception as e:
+        print(f"Could not add reaction: {e}")
     incident_text = event["text"]
 
     # Track this thread so we respond to follow-ups without needing @mention
